@@ -31,11 +31,10 @@ import net.mamoe.mirai.network.WrongPasswordException
 import net.mamoe.mirai.qqandroid.QQAndroidBot
 import net.mamoe.mirai.qqandroid.contact.*
 import net.mamoe.mirai.qqandroid.network.protocol.data.jce.StTroopNum
-import net.mamoe.mirai.qqandroid.network.protocol.data.proto.MsgSvc
 import net.mamoe.mirai.qqandroid.network.protocol.packet.*
 import net.mamoe.mirai.qqandroid.network.protocol.packet.KnownPacketFactories.PacketFactoryIllegalState10008Exception
 import net.mamoe.mirai.qqandroid.network.protocol.packet.chat.GroupInfoImpl
-import net.mamoe.mirai.qqandroid.network.protocol.packet.chat.receive.MessageSvcPbGetMsg
+import net.mamoe.mirai.qqandroid.network.protocol.packet.chat.receive.startMessageSvcSync
 import net.mamoe.mirai.qqandroid.network.protocol.packet.list.FriendList
 import net.mamoe.mirai.qqandroid.network.protocol.packet.login.ConfigPushSvc
 import net.mamoe.mirai.qqandroid.network.protocol.packet.login.Heartbeat
@@ -412,9 +411,7 @@ internal class QQAndroidBotNetworkHandler(coroutineContext: CoroutineContext, bo
     private suspend fun syncMessageSvc() {
         logger.info { "Syncing friend message history..." }
         withTimeoutOrNull(30000) {
-            launch(CoroutineName("Syncing friend message history")) { syncFromEvent<MessageSvcPbGetMsg.GetMsgSuccess, Unit> { Unit } }
-            MessageSvcPbGetMsg(bot.client, MsgSvc.SyncFlag.START, null).sendAndExpect<Packet>()
-
+            bot.client.c2cMessageSync.messageSvcSyncSession = bot.startMessageSvcSync(null)
         } ?: error("timeout syncing friend message history")
         logger.info { "Syncing friend message history: Success" }
     }
@@ -486,6 +483,7 @@ internal class QQAndroidBotNetworkHandler(coroutineContext: CoroutineContext, bo
             input
         ) { packetFactory: PacketFactory<P>, packet: P, commandName: String, sequenceId: Int ->
             if (packet is MultiPacket<*>) {
+                handlePacket(null, packet, commandName, sequenceId)
                 packet.forEach {
                     handlePacket(null, it, commandName, sequenceId)
                 }

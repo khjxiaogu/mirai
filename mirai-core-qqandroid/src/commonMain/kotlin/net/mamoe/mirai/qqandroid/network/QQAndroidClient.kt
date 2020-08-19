@@ -11,9 +11,10 @@
 
 package net.mamoe.mirai.qqandroid.network
 
-import kotlinx.atomicfu.AtomicBoolean
 import kotlinx.atomicfu.AtomicInt
 import kotlinx.atomicfu.atomic
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.io.core.*
 import net.mamoe.mirai.data.OnlineStatus
 import net.mamoe.mirai.network.LoginFailedException
@@ -28,6 +29,7 @@ import net.mamoe.mirai.qqandroid.utils.*
 import net.mamoe.mirai.qqandroid.utils.cryptor.ECDH
 import net.mamoe.mirai.qqandroid.utils.cryptor.TEA
 import net.mamoe.mirai.utils.*
+import kotlin.jvm.JvmField
 import kotlin.jvm.Volatile
 import kotlin.random.Random
 
@@ -206,12 +208,20 @@ internal open class QQAndroidClient(
     val protocolVersion: Short = 8001
 
     class C2cMessageSyncData {
-        val firstNotify: AtomicBoolean = atomic(true)
+        @JvmField
+        @Volatile
+        var firstNotify: Boolean = false
 
         @Volatile
         var syncCookie: ByteArray? = null
         var pubAccountCookie = EMPTY_BYTE_ARRAY
         var msgCtrlBuf: ByteArray = EMPTY_BYTE_ARRAY
+
+        @JvmField
+        val syncLock: Mutex = Mutex()
+
+        @Volatile
+        var messageSvcSyncSession: Job? = null
     }
 
     val c2cMessageSync = C2cMessageSyncData()

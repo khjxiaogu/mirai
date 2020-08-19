@@ -17,11 +17,13 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.withLock
 import kotlinx.io.core.ByteReadPacket
 import kotlinx.io.core.discardExact
+import net.mamoe.mirai.Bot
 import net.mamoe.mirai.contact.Group
 import net.mamoe.mirai.contact.MemberPermission
 import net.mamoe.mirai.data.MemberInfo
 import net.mamoe.mirai.event.AbstractEvent
 import net.mamoe.mirai.event.Event
+import net.mamoe.mirai.event.events.BotEvent
 import net.mamoe.mirai.event.events.BotJoinGroupEvent
 import net.mamoe.mirai.event.events.MemberJoinEvent
 import net.mamoe.mirai.getFriendOrNull
@@ -86,11 +88,8 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
         )
     }
 
-    open class GetMsgSuccess(delegate: List<Packet>, syncCookie: ByteArray?) : Response(
-        MsgSvc.SyncFlag.STOP, delegate,
-        syncCookie
-    ), Event,
-        Packet.NoLog {
+    open class GetMsgSuccess(delegate: List<Packet>, syncCookie: ByteArray?, override val bot: Bot) :
+        Response(MsgSvc.SyncFlag.STOP, delegate, syncCookie), Event, Packet.NoLog, BotEvent {
         override fun toString(): String = "MessageSvcPbGetMsg.GetMsgSuccess(messages=<Iterable>))"
     }
 
@@ -101,8 +100,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
         internal val syncFlagFromServer: MsgSvc.SyncFlag,
         delegate: List<Packet>,
         val syncCookie: ByteArray?
-    ) :
-        AbstractEvent(),
+    ) : AbstractEvent(),
         MultiPacket<Packet>,
         Iterable<Packet> by (delegate) {
 
@@ -110,12 +108,13 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
             "MessageSvcPbGetMsg.Response(syncFlagFromServer=$syncFlagFromServer, messages=<Iterable>))"
     }
 
-    object EmptyResponse : GetMsgSuccess(emptyList(), null)
+    class EmptyResponse(fromBot: Bot) : GetMsgSuccess(emptyList(), null, fromBot)
 
     private fun MsgComm.Msg.getNewMemberInfo(): MemberInfo {
         return object : MemberInfo {
-            override val nameCard: String get() = msgHead.authNick.takeIf { it.isNotEmpty() }
-                ?: msgHead.fromNick
+            override val nameCard: String
+                get() = msgHead.authNick.takeIf { it.isNotEmpty() }
+                    ?: msgHead.fromNick
             override val permission: MemberPermission get() = MemberPermission.MEMBER
             override val specialTitle: String get() = ""
             override val muteTimestamp: Int get() = 0
@@ -133,7 +132,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
         if (resp.result != 0) {
             bot.network.logger
                 .warning { "MessageSvcPushNotify: result != 0, result = ${resp.result}, errorMsg=${resp.errmsg}" }
-            return EmptyResponse
+            return EmptyResponse(bot)
         }
 
         bot.client.c2cMessageSync.syncCookie = resp.syncCookie
@@ -141,7 +140,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
         bot.client.c2cMessageSync.msgCtrlBuf = resp.msgCtrlBuf
 
         if (resp.uinPairMsgs == null) {
-            return EmptyResponse
+            return EmptyResponse(bot)
         }
 
         val messages = resp.uinPairMsgs.asFlow()
@@ -371,39 +370,9 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
             }
         val list: List<Packet> = messages.toList()
         if (resp.syncFlag == MsgSvc.SyncFlag.STOP) {
-            return GetMsgSuccess(list, resp.syncCookie)
+            return GetMsgSuccess(list, resp.syncCookie, bot)
         }
         return Response(resp.syncFlag, list, resp.syncCookie)
-    }
-
-    override suspend fun QQAndroidBot.handle(packet: Response) {
-        when (packet.syncFlagFromServer) {
-            MsgSvc.SyncFlag.STOP -> {
-
-            }
-
-            MsgSvc.SyncFlag.START -> {
-                network.run {
-                    MessageSvcPbGetMsg(
-                        client,
-                        MsgSvc.SyncFlag.CONTINUE,
-                        packet.syncCookie
-                    ).sendAndExpect<Packet>()
-                }
-                return
-            }
-
-            MsgSvc.SyncFlag.CONTINUE -> {
-                network.run {
-                    MessageSvcPbGetMsg(
-                        client,
-                        MsgSvc.SyncFlag.CONTINUE,
-                        packet.syncCookie
-                    ).sendAndExpect<Packet>()
-                }
-                return
-            }
-        }
     }
 }
 
