@@ -1,8 +1,8 @@
 /*
  * Copyright 2019-2020 Mamoe Technologies and contributors.
  *
- * 此源代码的使用受 GNU AFFERO GENERAL PUBLIC LICENSE version 3 with Mamoe Exceptions 许可证的约束, 可以在以下链接找到该许可证.
- * Use of this source code is governed by the GNU AFFERO GENERAL PUBLIC LICENSE version 3 with Mamoe Exceptions license that can be found via the following link.
+ * 此源代码的使用受 GNU AFFERO GENERAL PUBLIC LICENSE version 3 许可证的约束, 可以在以下链接找到该许可证.
+ * Use of this source code is governed by the GNU AFFERO GENERAL PUBLIC LICENSE version 3 license that can be found via the following link.
  *
  * https://github.com/mamoe/mirai/blob/master/LICENSE
  */
@@ -12,8 +12,11 @@
 package net.mamoe.mirai.qqandroid.network.protocol.packet.chat.receive
 
 import kotlinx.atomicfu.loop
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.io.core.ByteReadPacket
 import kotlinx.io.core.discardExact
@@ -42,6 +45,7 @@ import net.mamoe.mirai.qqandroid.network.protocol.packet.OutgoingPacketFactory
 import net.mamoe.mirai.qqandroid.network.protocol.packet.buildOutgoingUniPacket
 import net.mamoe.mirai.qqandroid.network.protocol.packet.chat.GroupInfoImpl
 import net.mamoe.mirai.qqandroid.network.protocol.packet.chat.NewContact
+import net.mamoe.mirai.qqandroid.network.protocol.packet.chat.toLongUnsigned
 import net.mamoe.mirai.qqandroid.network.protocol.packet.list.FriendList
 import net.mamoe.mirai.qqandroid.utils.io.serialization.readProtoBuf
 import net.mamoe.mirai.qqandroid.utils.io.serialization.writeProtoBuf
@@ -50,12 +54,15 @@ import net.mamoe.mirai.qqandroid.utils.toInt
 import net.mamoe.mirai.qqandroid.utils.toUHexString
 import net.mamoe.mirai.utils.debug
 import net.mamoe.mirai.utils.warning
+import kotlin.random.Random
 
 
 /**
  * 获取好友消息和消息记录
  */
 internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Response>("MessageSvc.PbGetMsg") {
+
+
     @Suppress("SpellCheckingInspection")
     operator fun invoke(
         client: QQAndroidClient,
@@ -77,7 +84,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                 whisperSessionId = 0,
                 syncFlag = syncFlag,
                 //  serverBuf = from.serverBuf ?: EMPTY_BYTE_ARRAY,
-                syncCookie = syncCookie ?: client.c2cMessageSync.syncCookie
+                syncCookie = syncCookie ?: client.syncingController.syncCookie
                 ?: byteArrayOf()//.also { client.c2cMessageSync.syncCookie = it },
                 // syncFlag = client.c2cMessageSync.syncFlag,
                 //msgCtrlBuf = client.c2cMessageSync.msgCtrlBuf,
@@ -114,14 +121,26 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
 
     private fun MsgComm.Msg.getNewMemberInfo(): MemberInfo {
         return object : MemberInfo {
-            override val nameCard: String get() = msgHead.authNick.takeIf { it.isNotEmpty() }
-                ?: msgHead.fromNick
+            override val nameCard: String
+                get() = msgHead.authNick.takeIf { it.isNotEmpty() }
+                    ?: msgHead.fromNick
             override val permission: MemberPermission get() = MemberPermission.MEMBER
             override val specialTitle: String get() = ""
             override val muteTimestamp: Int get() = 0
             override val uin: Long get() = msgHead.authUin
             override val nick: String = msgHead.authNick.takeIf { it.isNotEmpty() }
                 ?: msgHead.fromNick
+        }
+    }
+
+    private suspend fun QQAndroidBot.createGroupForBot(groupUin: Long): Group? {
+        val group = getGroupByUinOrNull(groupUin)
+        if (group != null) {
+            return null
+        }
+
+        return getNewGroup(Group.calculateGroupCodeByGroupUin(groupUin))?.apply {
+            groups.delegate.addLast(this)
         }
     }
 
@@ -133,12 +152,32 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
         if (resp.result != 0) {
             bot.network.logger
                 .warning { "MessageSvcPushNotify: result != 0, result = ${resp.result}, errorMsg=${resp.errmsg}" }
+            bot.network.launch(CoroutineName("MessageSvcPushNotify.retry")) {
+                delay(500 + Random.nextLong(0, 1000))
+                bot.network.run {
+                    MessageSvcPbGetMsg(bot.client, syncCookie = null).sendWithoutExpect()
+                }
+            }
             return EmptyResponse
         }
+        when (resp.msgRspType) {
+            0 -> {
+                bot.client.syncingController.syncCookie = resp.syncCookie
+                bot.client.syncingController.pubAccountCookie = resp.pubAccountCookie
+            }
+            1 -> {
+                bot.client.syncingController.syncCookie = resp.syncCookie
+            }
+            2 -> {
+                bot.client.syncingController.pubAccountCookie = resp.pubAccountCookie
 
-        bot.client.c2cMessageSync.syncCookie = resp.syncCookie
-        bot.client.c2cMessageSync.pubAccountCookie = resp.pubAccountCookie
-        bot.client.c2cMessageSync.msgCtrlBuf = resp.msgCtrlBuf
+            }
+        }
+
+//        bot.logger.debug(resp.msgRspType._miraiContentToString())
+//        bot.logger.debug(resp.syncCookie._miraiContentToString())
+
+        bot.client.syncingController.msgCtrlBuf = resp.msgCtrlBuf
 
         if (resp.uinPairMsgs == null) {
             return EmptyResponse
@@ -151,30 +190,26 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                     .filter { msg: MsgComm.Msg -> msg.msgHead.msgTime > it.lastReadTime.toLong() and 4294967295L }
             }.also {
                 MessageSvcPbDeleteMsg.delete(bot, it) // 删除消息
-                // todo 实现一个锁来防止重复收到消息
             }
-            .mapNotNull<MsgComm.Msg, Packet> { msg ->
-
-                suspend fun createGroupForBot(groupUin: Long): Group? {
-                    val group = bot.getGroupByUinOrNull(groupUin)
-                    if (group != null) {
-                        return null
-                    }
-
-                    return bot.getNewGroup(Group.calculateGroupCodeByGroupUin(groupUin))?.apply {
-                        bot.groups.delegate.addLast(this)
-                    }
-                }
+            .mapNotNull { msg ->
+                if (!bot.client.syncingController.pbGetMessageCacheList.addCache(
+                        QQAndroidClient.MessageSvcSyncData.PbGetMessageSyncId(
+                            uid = msg.msgHead.msgUid,
+                            sequence = msg.msgHead.msgSeq,
+                            time = msg.msgHead.msgTime
+                        )
+                    )
+                ) return@mapNotNull null
 
                 when (msg.msgHead.msgType) {
                     33 -> bot.groupListModifyLock.withLock {
 
                         if (msg.msgHead.authUin == bot.id) {
                             // 邀请入群
-                            return@mapNotNull createGroupForBot(msg.msgHead.fromUin)?.let {
+                            return@mapNotNull bot.createGroupForBot(msg.msgHead.fromUin)?.let {
                                 // package: 27 0B 60 E7 01 CA CC 69 8B 83 44 71 47 90 06 B9 DC C0 ED D4 B1 00 30 33 44 30 42 38 46 30 39 37 32 38 35 43 34 31 38 30 33 36 41 34 36 31 36 31 35 32 37 38 46 46 43 30 41 38 30 36 30 36 45 38 31 43 39 41 34 38 37
                                 // package: groupUin + 01 CA CC 69 8B 83 + invitorUin + length(06) + string + magicKey
-                                val invitorUin = msg.msgBody.msgContent.sliceArray(10..13).toInt().toLong()
+                                val invitorUin = msg.msgBody.msgContent.sliceArray(10..13).toInt().toLongUnsigned()
                                 BotJoinGroupEvent.Invite(it[invitorUin])
                             }
                         } else {
@@ -213,7 +248,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                     }
 
                     38 -> bot.groupListModifyLock.withLock { // 建群
-                        return@mapNotNull createGroupForBot(msg.msgHead.fromUin)
+                        return@mapNotNull bot.createGroupForBot(msg.msgHead.fromUin)
                             ?.let { BotJoinGroupEvent.Active(it) }
                     }
 
@@ -222,7 +257,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                         // msg.msgHead.authUin: 处理人
 
                         return@mapNotNull if (msg.msgHead.toUin == bot.id) {
-                            createGroupForBot(msg.msgHead.fromUin)
+                            bot.createGroupForBot(msg.msgHead.fromUin)
                                 ?.let { BotJoinGroupEvent.Active(it) }
                         } else {
                             null
@@ -294,18 +329,15 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                             return@mapNotNull null
                         }
 
-                        if (friend.lastMessageSequence.compareAndSet(
-                                friend.lastMessageSequence.value,
-                                msg.msgHead.msgSeq
-                            )
-                        ) {
-                            return@mapNotNull FriendMessageEvent(
-                                friend,
-                                msg.toMessageChain(bot, groupIdOrZero = 0, onlineSource = true),
-                                msg.msgHead.msgTime
-                            )
+                        friend.lastMessageSequence.loop {
+                            if (friend.lastMessageSequence.compareAndSet(it, msg.msgHead.msgSeq)) {
+                                return@mapNotNull FriendMessageEvent(
+                                    friend,
+                                    msg.toMessageChain(bot, groupIdOrZero = 0, onlineSource = true),
+                                    msg.msgHead.msgTime
+                                )
+                            } else return@mapNotNull null
                         }
-                        return@mapNotNull null
                     }
                     208 -> {
                         // friend ptt
@@ -387,7 +419,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                     MessageSvcPbGetMsg(
                         client,
                         MsgSvc.SyncFlag.CONTINUE,
-                        packet.syncCookie
+                        bot.client.syncingController.syncCookie
                     ).sendAndExpect<Packet>()
                 }
                 return
@@ -398,7 +430,7 @@ internal object MessageSvcPbGetMsg : OutgoingPacketFactory<MessageSvcPbGetMsg.Re
                     MessageSvcPbGetMsg(
                         client,
                         MsgSvc.SyncFlag.CONTINUE,
-                        packet.syncCookie
+                        bot.client.syncingController.syncCookie
                     ).sendAndExpect<Packet>()
                 }
                 return
@@ -414,28 +446,11 @@ internal suspend fun QQAndroidBot.getNewGroup(groupCode: Long): Group? {
             .sendAndExpect<FriendList.GetTroopListSimplify.Response>(timeoutMillis = 10_000, retry = 5)
     }.groups.firstOrNull { it.groupCode == groupCode } ?: return null
 
-    @Suppress("DuplicatedCode")
     return GroupImpl(
         bot = this,
         coroutineContext = coroutineContext,
         id = groupCode,
-        groupInfo = _lowLevelQueryGroupInfo(troopNum.groupCode).apply {
-            this as GroupInfoImpl
-
-            if (this.delegate.groupName == null) {
-                this.delegate.groupName = troopNum.groupName
-            }
-
-            if (this.delegate.groupMemo == null) {
-                this.delegate.groupMemo = troopNum.groupMemo
-            }
-
-            if (this.delegate.groupUin == null) {
-                this.delegate.groupUin = troopNum.groupUin
-            }
-
-            this.delegate.groupCode = troopNum.groupCode
-        },
+        groupInfo = GroupInfoImpl(troopNum),
         members = _lowLevelQueryGroupMemberList(
             troopNum.groupUin,
             troopNum.groupCode,
